@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-movie_tools.py — Right-click friendly movie/series tools (Trailer-free, now with Info pane)
+movie_tools.py — Right-click friendly movie/series tools (Info pane + Trailers)
 - GUI picker (double-click) or CLI commands
 - Instant TMDB lookup on chosen file/folder: title, year, synopsis, poster, trailer button
 - Movies: rename via format (default "{ny}/{ny}") + poster + clean + prune
@@ -11,20 +11,22 @@ movie_tools.py — Right-click friendly movie/series tools (Trailer-free, now wi
 - GUI:
     • Reselect target
     • Movies or Series
-    • Poster / Season posters / Clean / Prune / Dry-run
+    • Poster / Season posters / Trailer download / Clean / Prune / Dry-run
     • Series layout (flat/folders)
     • Custom Movie + Series formats
     • Clickable placeholders that insert into the focused format field
     • Live CLI preview + "Copy" button
-    • Clear "Info" section with poster + year + synopsis + "Watch trailer"
+    • Clear "Info" section with poster + year + synopsis + "Watch trailer" + "Download trailer"
 - CLI:
     • Same options via arguments
     • --format supported on both "rename" and "series"
+    • --download-trailer on both subcommands
 
 Requirements:
   pip install requests
   (optional) platformdirs
   (optional) Pillow   (auto-installed for GUI poster preview if missing)
+  (optional) yt-dlp   (auto-installed for trailer downloads if missing)
 """
 
 import os
@@ -115,6 +117,47 @@ def ensure_pillow_installed() -> bool:
         except Exception:
             return False
 
+def ensure_yt_dlp_installed() -> bool:
+    """Ensure yt-dlp is available (we run it as a module to avoid PATH issues)."""
+    try:
+        import yt_dlp  # noqa: F401
+        return True
+    except Exception:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "yt-dlp"])
+            import yt_dlp  # noqa: F401
+            return True
+        except Exception:
+            return False
+def download_trailer_with_ytdlp(url: str, out_dir: Path, dry_run: bool = False) -> bool:
+    """
+    Delegate to external trailer_dl.py which runs the exact yt-dlp command.
+    """
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        logging.info(f"  ↳ trailer: {url}\n      → {out_dir}")
+        if dry_run:
+            return True
+        script = Path(__file__).with_name("trailer_dl.py")
+        if not script.exists():
+            logging.warning(f"  ! Missing helper script: {script}. Create trailer_dl.py as provided.")
+            return False
+        res = subprocess.run([sys.executable, str(script), url, str(out_dir)],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if res.returncode != 0:
+            logging.warning("  ! yt-dlp failed via trailer_dl.py:\n" + res.stdout)
+            return False
+        return True
+    except Exception as e:
+        logging.warning(f"  ! trailer download error: {e}")
+        return False
+
+        
+        
+        
+        
+        
+        
 def guess_title_year_from_path(p: Path) -> Tuple[str, Optional[int]]:
     if p.is_file():
         stem = p.stem
@@ -130,6 +173,7 @@ def gui_options_dialog(target_path: Path, tmdb_for_lookup: Optional["TMDB"] = No
       mode: 'movies'|'series'
       cover: bool
       season_covers: bool
+      download_trailer: bool
       clean: bool
       prune: bool
       dry_run: bool
@@ -153,7 +197,7 @@ def gui_options_dialog(target_path: Path, tmdb_for_lookup: Optional["TMDB"] = No
 
     win = tk.Tk()
     win.title("Movie Tools — Options")
-    win.geometry("820x900")
+    win.geometry("860x740")
     try:
         win.attributes("-topmost", True)
         win.after(300, lambda: win.attributes("-topmost", False))
@@ -168,6 +212,7 @@ def gui_options_dialog(target_path: Path, tmdb_for_lookup: Optional["TMDB"] = No
     mode_var = tk.IntVar(value=0)  # 0=movies, 1=series
     cover_var = tk.IntVar(value=1)
     season_covers_var = tk.IntVar(value=0)
+    trailer_dl_var = tk.IntVar(value=0)
     clean_var = tk.IntVar(value=1)
     prune_var = tk.IntVar(value=1)
     dry_run_var = tk.IntVar(value=0)
@@ -210,7 +255,7 @@ def gui_options_dialog(target_path: Path, tmdb_for_lookup: Optional["TMDB"] = No
         else:
             target_entry = movie_fmt_entry if mode_var.get() == 0 else series_fmt_entry
         try:
-            target_entry.insert(tk.INSERT, token)
+            target_entry.insert("insert", token)
         except Exception:
             var = movie_fmt_var if target_entry is movie_fmt_entry else series_fmt_var
             var.set((var.get() or "") + token)
@@ -224,6 +269,8 @@ def gui_options_dialog(target_path: Path, tmdb_for_lookup: Optional["TMDB"] = No
             args = [sys.executable, script, "rename", path_q]
             if not cover_var.get():
                 args.append("--no-cover")
+            if trailer_dl_var.get():
+                args.append("--download-trailer")
             if not clean_var.get():
                 args.append("--no-clean")
             if not prune_var.get():
@@ -243,6 +290,8 @@ def gui_options_dialog(target_path: Path, tmdb_for_lookup: Optional["TMDB"] = No
                 args.append("--cover")
             if season_covers_var.get():
                 args.append("--season-covers")
+            if trailer_dl_var.get():
+                args.append("--download-trailer")
             if not clean_var.get():
                 args.append("--no-clean")
             if not prune_var.get():
@@ -284,6 +333,21 @@ def gui_options_dialog(target_path: Path, tmdb_for_lookup: Optional["TMDB"] = No
     def open_trailer():
         if trailer_url["url"]:
             webbrowser.open(trailer_url["url"])
+
+    def download_trailer_gui():
+        if not trailer_url["url"]:
+            return
+        target = current_target["path"]
+        out_dir = target.parent if target.is_file() else target
+        ok = download_trailer_with_ytdlp(trailer_url["url"], out_dir=out_dir, dry_run=False)
+        try:
+            from tkinter import messagebox
+            if ok:
+                messagebox.showinfo("Trailer", f"Trailer saved in:\n{out_dir}")
+            else:
+                messagebox.showwarning("Trailer", "Trailer download failed. See log for details.")
+        except Exception:
+            pass
 
     def do_lookup_and_fill():
         target = current_target["path"]
@@ -355,6 +419,7 @@ def gui_options_dialog(target_path: Path, tmdb_for_lookup: Optional["TMDB"] = No
         result["mode"] = "movies" if mode_var.get() == 0 else "series"
         result["cover"] = bool(cover_var.get())
         result["season_covers"] = bool(season_covers_var.get())
+        result["download_trailer"] = bool(trailer_dl_var.get())
         result["clean"] = bool(clean_var.get())
         result["prune"] = bool(prune_var.get())
         result["dry_run"] = bool(dry_run_var.get())
@@ -392,9 +457,10 @@ def gui_options_dialog(target_path: Path, tmdb_for_lookup: Optional["TMDB"] = No
 
     ttk.Label(info_frame, textvariable=info_title_var, font=("Segoe UI", 11, "bold")).grid(row=0, column=1, sticky="w")
     ttk.Label(info_frame, textvariable=info_year_var, foreground="#777").grid(row=1, column=1, sticky="w")
-    overview_lbl = ttk.Label(info_frame, textvariable=info_overview, wraplength=600, justify="left")
+    overview_lbl = ttk.Label(info_frame, textvariable=info_overview, wraplength=650, justify="left")
     overview_lbl.grid(row=2, column=1, sticky="we", pady=(2,0))
     ttk.Button(info_frame, text="Watch trailer", command=open_trailer).grid(row=3, column=1, sticky="w", pady=(6,0))
+    ttk.Button(info_frame, text="Download trailer", command=download_trailer_gui).grid(row=3, column=1, sticky="w", padx=(140,0), pady=(6,0))
 
     row += 1
     ttk.Separator(frm, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="we", pady=8)
@@ -411,10 +477,11 @@ def gui_options_dialog(target_path: Path, tmdb_for_lookup: Optional["TMDB"] = No
     ttk.Checkbutton(frm, text="Download poster", variable=cover_var, command=update_cli_preview).grid(row=row+1, column=0, sticky="w")
     season_covers_chk = ttk.Checkbutton(frm, text="Season posters (series)", variable=season_covers_var, command=update_cli_preview)
     season_covers_chk.grid(row=row+1, column=1, sticky="w")
-    ttk.Checkbutton(frm, text="Clean clutter", variable=clean_var, command=update_cli_preview).grid(row=row+2, column=0, sticky="w")
-    ttk.Checkbutton(frm, text="Prune empty folders", variable=prune_var, command=update_cli_preview).grid(row=row+2, column=1, sticky="w")
-    ttk.Checkbutton(frm, text="Dry run (no changes)", variable=dry_run_var, command=update_cli_preview).grid(row=row+3, column=0, sticky="w")
-    row += 4
+    ttk.Checkbutton(frm, text="Download trailer", variable=trailer_dl_var, command=update_cli_preview).grid(row=row+2, column=0, sticky="w")
+    ttk.Checkbutton(frm, text="Clean clutter", variable=clean_var, command=update_cli_preview).grid(row=row+3, column=0, sticky="w")
+    ttk.Checkbutton(frm, text="Prune empty folders", variable=prune_var, command=update_cli_preview).grid(row=row+3, column=1, sticky="w")
+    ttk.Checkbutton(frm, text="Dry run (no changes)", variable=dry_run_var, command=update_cli_preview).grid(row=row+4, column=0, sticky="w")
+    row += 5
 
     # Format helpers
     help_text = "Placeholders: {n} title, {y} year, {ny} title+year, {s} season, {e} episode, {s00e00}, {t} episode title"
@@ -928,6 +995,13 @@ def best_trailer_url(video_list: List[Dict[str, Any]]) -> Optional[str]:
         return best["url"]
     return None
 
+def get_movie_trailer_url(tmdb: "TMDB", movie_id: int) -> Optional[str]:
+    try:
+        vids = tmdb.movie_videos(int(movie_id))
+        return best_trailer_url(vids)
+    except Exception:
+        return None
+
 # ---------------- Renamer core (Movies) ----------------
 def process_video(tmdb: TMDB, file_path: Path, dry_run: bool) -> Optional[Tuple[Path, Path, Dict[str, Any]]]:
     stem = file_path.stem
@@ -975,6 +1049,8 @@ def handle_root(
     dry_run: bool,
 ):
     touched_parents = set()
+    downloaded_trailer_dirs = set()  # avoid duplicates per folder
+    do_trailer = bool(globals().get("CLI_DL_TRAILER", False))
 
     if root.is_file():
         if root.suffix.lower() in VIDEO_EXTS:
@@ -984,6 +1060,16 @@ def handle_root(
                 touched_parents.add(old.parent)
                 if do_cover and mv:
                     download_poster(tmdb, mv, new.parent, dry_run=dry_run)
+                if do_trailer and mv:
+                    dest_dir = new.parent
+                    key = str(dest_dir)
+                    if key not in downloaded_trailer_dirs:
+                        url = get_movie_trailer_url(tmdb, mv.get("id"))
+                        if url:
+                            ok = download_trailer_with_ytdlp(url, dest_dir, dry_run=dry_run)
+                            if ok:
+                                downloaded_trailer_dirs.add(key)
+                                log_jsonl("trailer", url=url, path=str(dest_dir))
         else:
             logging.warning("Not a supported video file.")
     else:
@@ -998,6 +1084,16 @@ def handle_root(
                     touched_parents.add(old.parent)
                     if do_cover and mv:
                         download_poster(tmdb, mv, new.parent, dry_run=dry_run)
+                    if do_trailer and mv:
+                        dest_dir = new.parent
+                        key = str(dest_dir)
+                        if key not in downloaded_trailer_dirs:
+                            url = get_movie_trailer_url(tmdb, mv.get("id"))
+                            if url:
+                                ok = download_trailer_with_ytdlp(url, dest_dir, dry_run=dry_run)
+                                if ok:
+                                    downloaded_trailer_dirs.add(key)
+                                    log_jsonl("trailer", url=url, path=str(dest_dir))
 
     if do_clean:
         for folder in sorted(touched_parents):
@@ -1094,7 +1190,7 @@ def try_tv_match_with_fallbacks(tmdbtv, file_path: Path, title_guess: str, year_
     _log_debug_match(debug, "NO MATCH", uniq, last_results)
     return None
 
-def process_series_file(tmdbtv: TMDBTV, file_path: Path, layout: str, do_cover: bool, dry_run: bool) -> Optional[Tuple[Path, Path]]:
+def process_series_file(tmdbtv: TMDBTV, file_path: Path, layout: str, do_cover: bool, dry_run: bool) -> Optional[Tuple[Path, Path, Dict[str, Any]]]:
     stem = file_path.stem
     title_guess, year_guess = split_stem_year(stem)
     _, _, season, episode = parse_filename_basic(str(file_path))
@@ -1166,14 +1262,33 @@ def process_series_file(tmdbtv: TMDBTV, file_path: Path, layout: str, do_cover: 
         except Exception:
             pass
 
-    return (file_path, dest)
+    return (file_path, dest, show)
 
 def handle_series_root(root: Path, tmdbtv: TMDBTV, layout: str, do_cover: bool, do_clean: bool, do_prune: bool, dry_run: bool):
     touched = set()
+    downloaded_trailer_dirs = set()
+    do_trailer = bool(globals().get("CLI_DL_TRAILER", False))
+
     if root.is_file():
         if root.suffix.lower() in VIDEO_EXTS:
             res = process_series_file(tmdbtv, root, layout, do_cover, dry_run)
-            if res: touched.add(res[0].parent)
+            if res:
+                old, new, show = res
+                touched.add(res[0].parent)
+                if do_trailer and show:
+                    series_dir = new.parent if layout == "flat" else new.parent.parent
+                    key = str(series_dir)
+                    if key not in downloaded_trailer_dirs:
+                        try:
+                            vids = tmdbtv.tv_videos(int(show["id"]))
+                            url = best_trailer_url(vids)
+                        except Exception:
+                            url = None
+                        if url:
+                            ok = download_trailer_with_ytdlp(url, series_dir, dry_run=dry_run)
+                            if ok:
+                                downloaded_trailer_dirs.add(key)
+                                log_jsonl("trailer", url=url, path=str(series_dir))
         else:
             logging.warning("Not a supported video file.")
     else:
@@ -1183,7 +1298,23 @@ def handle_series_root(root: Path, tmdbtv: TMDBTV, layout: str, do_cover: bool, 
                 if p.suffix.lower() not in VIDEO_EXTS:
                     continue
                 res = process_series_file(tmdbtv, p, layout, do_cover, dry_run)
-                if res: touched.add(res[0].parent)
+                if res:
+                    old, new, show = res
+                    touched.add(res[0].parent)
+                    if do_trailer and show:
+                        series_dir = new.parent if layout == "flat" else new.parent.parent
+                        key = str(series_dir)
+                        if key not in downloaded_trailer_dirs:
+                            try:
+                                vids = tmdbtv.tv_videos(int(show["id"]))
+                                url = best_trailer_url(vids)
+                            except Exception:
+                                url = None
+                            if url:
+                                ok = download_trailer_with_ytdlp(url, series_dir, dry_run=dry_run)
+                                if ok:
+                                    downloaded_trailer_dirs.add(key)
+                                    log_jsonl("trailer", url=url, path=str(series_dir))
 
     if do_clean:
         for folder in sorted(touched):
@@ -1240,11 +1371,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Movie Tools: rename movies & series (TMDB) and posters.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    pr = sub.add_parser("rename", help="Movies: format+poster+clean+prune.")
+    pr = sub.add_parser("rename", help="Movies: format+poster+trailer+clean+prune.")
     pr.add_argument("path", nargs="?", help="File or folder to process.")
     pr.add_argument("--api-key", help="TMDB API key (else ENV/config/prompt).")
     pr.add_argument("--language", default="en-US")
     pr.add_argument("--no-cover", action="store_true")
+    pr.add_argument("--download-trailer", action="store_true", help="Download the best trailer into the target folder.")
     pr.add_argument("--no-clean", action="store_true")
     pr.add_argument("--no-prune", action="store_true")
     pr.add_argument("--dry-run", action="store_true")
@@ -1253,7 +1385,7 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--pause", action="store_true", help="Wait for Enter before exiting.")
     pr.add_argument("--pause-seconds", type=int, default=0, help="Sleep N seconds before exiting.")
 
-    ps = sub.add_parser("series", help="TV: flat or folder layouts; optional poster; clean+prune; optional season posters.")
+    ps = sub.add_parser("series", help="TV: flat or folder layouts; optional poster; season posters; trailer; clean+prune.")
     ps.add_argument("path", nargs="?", help="File or folder to process.")
     ps.add_argument("--api-key", help="TMDB API key (else ENV/config/prompt).")
     ps.add_argument("--language", default="en-US")
@@ -1261,6 +1393,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="flat: {n} ({y}) - {s00e00} - {t}; folders: {ny}/{ny} - Season {s}/{ny} - {s00e00} - {t}")
     ps.add_argument("--cover", action="store_true", help="Download series poster into target folder(s).")
     ps.add_argument("--season-covers", action="store_true", help="Also download season posters into each Season folder.")
+    ps.add_argument("--download-trailer", action="store_true", help="Download the best series trailer into the series folder (once).")
     ps.add_argument("--no-clean", action="store_true")
     ps.add_argument("--no-prune", action="store_true")
     ps.add_argument("--dry-run", action="store_true")
@@ -1299,6 +1432,7 @@ def auto_run_on(target: Path):
     mode = opts.get("mode", "movies")
     do_cover = bool(opts.get("cover", True))
     do_season_covers = bool(opts.get("season_covers", False))
+    do_trailer = bool(opts.get("download_trailer", False))
     do_clean = bool(opts.get("clean", True))
     do_prune = bool(opts.get("prune", True))
     dry_run = bool(opts.get("dry_run", False))
@@ -1310,6 +1444,7 @@ def auto_run_on(target: Path):
     globals()["CLI_MOVIE_FMT"] = movie_fmt if mode == "movies" else None
     globals()["CLI_SERIES_FMT"] = series_fmt if mode == "series" else None
     globals()["CLI_SEASON_COVERS"] = do_season_covers
+    globals()["CLI_DL_TRAILER"] = do_trailer
 
     api_key = ensure_api_key(None)   # Only popup if missing/invalid
     language = "en-US"               # could be extended to a GUI entry later
@@ -1361,6 +1496,7 @@ def main():
         api_key = ensure_api_key(getattr(args, "api_key", None))
         tmdb = TMDB(api_key=api_key, language=getattr(args, "language", "en-US"))
         target = Path(args.path).expanduser().resolve() if args.path else Path.cwd()
+        globals()["CLI_DL_TRAILER"] = bool(getattr(args, "download_trailer", False))
         logging.info(f"[CLI] Movies — Target: {target}")
         log_jsonl("start", mode="movies", path=str(target))
         handle_root(
@@ -1382,6 +1518,7 @@ def main():
         globals()["CLI_FORCE_YEAR"]  = getattr(args, "force_year", None)
         globals()["CLI_DEBUG_MATCH"] = getattr(args, "debug_match", False)
         globals()["CLI_SEASON_COVERS"] = bool(getattr(args, "season_covers", False))
+        globals()["CLI_DL_TRAILER"] = bool(getattr(args, "download_trailer", False))
 
         api_key = ensure_api_key(getattr(args, "api_key", None))
         tmdbtv = TMDBTV(api_key=api_key, language=getattr(args, "language", "en-US"))
